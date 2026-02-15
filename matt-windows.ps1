@@ -3,10 +3,12 @@
 # Self-contained: download and run. All dependencies embedded inline.
 #
 # Usage (PowerShell as Administrator):
-#   irm tinyurl.com/XXXXX | iex
+#   irm tinyurl.com/29jk9v83 | iex
 #   OR: .\matt-windows-bootstrap.ps1
 #
-# Role: Interactive Claude Code (human workstation) + icecream build worker (WSL)
+# Role: Primary powerhouse workstation (RTX 3070 Ti, high-end CPU)
+#       Interactive Claude Code + icecream build worker (WSL)
+#       Local Ollama for code inference + mesh network node
 #       Connects to arch-orchestrator (or iMac as temp scheduler)
 # =============================================================================
 
@@ -15,7 +17,7 @@ $ErrorActionPreference = "Stop"
 Write-Host @"
 
 ============================================
-  Matt's Fleet -- Windows Laptop Bootstrap
+  Matt's Fleet -- Windows Powerhouse Setup
 ============================================
 
 "@ -ForegroundColor Cyan
@@ -159,6 +161,50 @@ Write-Host "`n=== Phase 6: GPU Detection + Ollama ===" -ForegroundColor Yellow
 
 $script:OllamaInstalled = $false
 $script:OllamaModel = $null
+$existingModels = @()
+
+# --- Check for existing Ollama installation ---
+$ollamaCmd = $null
+$ollamaSearchPaths = @(
+    "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe",
+    "$env:ProgramFiles\Ollama\ollama.exe",
+    "C:\Users\Matt\AppData\Local\Programs\Ollama\ollama.exe"
+)
+
+# Try PATH first
+try {
+    $ollamaCmd = Get-Command ollama -ErrorAction Stop
+    Write-Host "  Ollama already installed: $($ollamaCmd.Source)" -ForegroundColor Green
+} catch {
+    # Try known install paths
+    foreach ($p in $ollamaSearchPaths) {
+        if (Test-Path $p) {
+            $ollamaCmd = $p
+            Write-Host "  Ollama found at: $p" -ForegroundColor Green
+            break
+        }
+    }
+}
+
+# If Ollama exists, check what models are already pulled
+if ($ollamaCmd) {
+    try {
+        $ollamaExe = if ($ollamaCmd -is [string]) { $ollamaCmd } else { $ollamaCmd.Source }
+        $listOutput = & $ollamaExe list 2>$null
+        if ($listOutput) {
+            Write-Host "  Existing models:" -ForegroundColor Cyan
+            $listOutput | ForEach-Object {
+                if ($_ -notmatch "^NAME") {
+                    $modelName = ($_ -split '\s+')[0]
+                    if ($modelName) {
+                        $existingModels += $modelName
+                        Write-Host "    - $modelName" -ForegroundColor White
+                    }
+                }
+            }
+        }
+    } catch {}
+}
 
 # --- GPU Detection (inlined) ---
 $gpus = @()
@@ -236,7 +282,8 @@ if ($gpus.Count -eq 0) {
     Write-Host "  No discrete GPU detected. Skipping Ollama." -ForegroundColor Yellow
 } else {
     $bestGpu = $gpus | Sort-Object VRAM_GB -Descending | Select-Object -First 1
-    Write-Host "  Best GPU: $($bestGpu.Vendor) $($bestGpu.Name) -- $($bestGpu.VRAM_GB) GB VRAM" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  GPU: $($bestGpu.Vendor) $($bestGpu.Name) -- $($bestGpu.VRAM_GB) GB VRAM" -ForegroundColor Cyan
 
     if ($bestGpu.VRAM_GB -lt 2) {
         Write-Host "  VRAM too low. Skipping Ollama." -ForegroundColor Yellow
@@ -254,9 +301,10 @@ if ($gpus.Count -eq 0) {
         }
 
         if ($modelInfo) {
-            Write-Host "  Selected: $($modelInfo.Model) ($($modelInfo.Tier))" -ForegroundColor Green
+            Write-Host "  Recommended model: $($modelInfo.Model) ($($modelInfo.Tier))" -ForegroundColor Green
 
-            if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
+            # Install Ollama if not present
+            if (-not $ollamaCmd) {
                 Write-Host "  Downloading Ollama installer..." -ForegroundColor White
                 $installerPath = "$env:TEMP\OllamaSetup.exe"
                 try {
@@ -266,20 +314,74 @@ if ($gpus.Count -eq 0) {
                 } catch {
                     Write-Host "  ERROR: Install Ollama manually: https://ollama.com/download" -ForegroundColor Red
                 }
+            } else {
+                Write-Host "  Ollama already installed, skipping download." -ForegroundColor Green
             }
 
-            if (Get-Command ollama -ErrorAction SilentlyContinue) {
+            # Resolve the working ollama executable
+            $ollamaExe = $null
+            try { $ollamaExe = (Get-Command ollama -ErrorAction Stop).Source } catch {}
+            if (-not $ollamaExe) {
+                foreach ($p in $ollamaSearchPaths) {
+                    if (Test-Path $p) { $ollamaExe = $p; break }
+                }
+            }
+
+            if ($ollamaExe) {
+                # Ensure server is running
                 $ollamaProc = Get-Process ollama -ErrorAction SilentlyContinue
                 if (-not $ollamaProc) {
-                    Start-Process ollama -ArgumentList "serve" -WindowStyle Hidden
+                    Start-Process $ollamaExe -ArgumentList "serve" -WindowStyle Hidden
                     Start-Sleep -Seconds 3
                 }
-                Write-Host "  Pulling $($modelInfo.Model)... (may take a while)" -ForegroundColor White
-                & ollama pull $modelInfo.Model
-                if ($LASTEXITCODE -eq 0) {
+
+                # Check if recommended model is already pulled
+                $recommendedAlreadyPulled = $existingModels | Where-Object { $_ -like "$($modelInfo.Model)*" }
+
+                if ($recommendedAlreadyPulled) {
+                    Write-Host "  $($modelInfo.Model) is already pulled!" -ForegroundColor Green
                     $script:OllamaInstalled = $true
                     $script:OllamaModel = $modelInfo.Model
-                    Write-Host "  Model ready!" -ForegroundColor Green
+                } else {
+                    # Show existing models and offer upgrade
+                    if ($existingModels.Count -gt 0) {
+                        Write-Host ""
+                        Write-Host "  You already have models installed. Your GPU can handle:" -ForegroundColor White
+                        Write-Host "    $($modelInfo.Model) ($($modelInfo.Desc))" -ForegroundColor Green
+                        Write-Host ""
+                        $pullChoice = Read-Host "  Pull $($modelInfo.Model) as well? (y/n, keeps existing models)"
+                    } else {
+                        $pullChoice = "y"
+                    }
+
+                    if ($pullChoice -eq "y" -or $pullChoice -eq "Y" -or $pullChoice -eq "yes") {
+                        Write-Host "  Pulling $($modelInfo.Model)... (may take a while)" -ForegroundColor White
+                        & $ollamaExe pull $modelInfo.Model
+                        if ($LASTEXITCODE -eq 0) {
+                            $script:OllamaInstalled = $true
+                            $script:OllamaModel = $modelInfo.Model
+                            Write-Host "  Model ready!" -ForegroundColor Green
+                        }
+                    } else {
+                        Write-Host "  Keeping existing models only." -ForegroundColor Gray
+                        # Use the first existing model
+                        if ($existingModels.Count -gt 0) {
+                            $script:OllamaInstalled = $true
+                            $script:OllamaModel = $existingModels[0]
+                        }
+                    }
+                }
+
+                # List all available models at the end
+                if ($existingModels.Count -gt 0 -or $script:OllamaInstalled) {
+                    Write-Host ""
+                    Write-Host "  All available models on this machine:" -ForegroundColor Cyan
+                    try {
+                        $finalList = & $ollamaExe list 2>$null
+                        $finalList | ForEach-Object {
+                            if ($_ -notmatch "^NAME") { Write-Host "    $_" -ForegroundColor White }
+                        }
+                    } catch {}
                 }
             }
         }
@@ -302,22 +404,21 @@ if (-not (Test-Path $profilePath)) {
 Write-Host @"
 
 ============================================
-  Matt's Windows Laptop ONLINE
+  Matt's Windows Powerhouse ONLINE
   Hostname: $Hostname
 ============================================
 
-Usage:
-  claude                  Interactive Claude Code
-  claude -p "task"        One-shot task
-  tailscale status        Check mesh network
-
 "@
 
+if ($bestGpu) {
+    Write-Host "  GPU:    $($bestGpu.Vendor) $($bestGpu.Name) ($($bestGpu.VRAM_GB) GB)" -ForegroundColor Cyan
+}
+
 if ($schedulerHost) {
-    Write-Host "  Icecream scheduler: $schedulerName ($schedulerHost)" -ForegroundColor Cyan
-    Write-Host "  Set up WSL icecc worker to connect to it" -ForegroundColor Gray
+    Write-Host "  Icecc:  $schedulerName ($schedulerHost)" -ForegroundColor Cyan
+    Write-Host "          Set up WSL icecc worker to connect" -ForegroundColor Gray
 } else {
-    Write-Host "  Icecream: not configured (set up later)" -ForegroundColor Gray
+    Write-Host "  Icecc:  not configured (set up later)" -ForegroundColor Gray
 }
 
 if ($script:OllamaInstalled) {
@@ -329,7 +430,13 @@ if ($script:OllamaInstalled) {
 
 Write-Host @"
 
-This is a human workstation -- Claude Code runs interactively.
-When arch-orchestrator is back, you can optionally run as an agent too.
+Usage:
+  claude                  Interactive Claude Code
+  claude -p "task"        One-shot task
+  tailscale status        Check mesh network
+
+This machine is your powerhouse workstation.
+Claude Code runs interactively with you at the keyboard.
+When arch-orchestrator is back, it can also join the agent mesh.
 
 "@
