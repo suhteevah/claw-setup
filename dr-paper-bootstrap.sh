@@ -419,13 +419,9 @@ sudo -u claude-agent mkdir -p "$OPENCLAW_DIR/plugins"
 
 if [ ! -d "$PLUGIN_DIR" ]; then
     echo "  Cloning model-load-optimizer..."
-    sudo -u claude-agent git clone https://github.com/suhteevah/claw-setup.git /tmp/claw-setup-tmp 2>/dev/null
-    if [ -d "/tmp/claw-setup-tmp/model-load-optimizer" ]; then
-        sudo -u claude-agent cp -r /tmp/claw-setup-tmp/model-load-optimizer "$PLUGIN_DIR"
-        rm -rf /tmp/claw-setup-tmp
-    else
-        sudo -u claude-agent mkdir -p "$PLUGIN_DIR"
-        echo "  WARNING: model-load-optimizer not found in repo."
+    sudo -u claude-agent git clone https://github.com/suhteevah/model-load-optimizer.git "$PLUGIN_DIR" 2>/dev/null
+    if [ ! -f "$PLUGIN_DIR/package.json" ]; then
+        echo "  WARNING: Clone failed. Create $PLUGIN_DIR manually and retry."
     fi
 fi
 

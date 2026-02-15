@@ -334,13 +334,9 @@ if [ "$OLLAMA_INSTALLED" = "1" ] && [ -n "$OLLAMA_MODEL" ]; then
 
     if [ ! -d "$PLUGIN_DIR" ]; then
         echo "  Cloning model-load-optimizer..."
-        git clone https://github.com/suhteevah/claw-setup.git /tmp/claw-setup-tmp 2>/dev/null
-        if [ -d "/tmp/claw-setup-tmp/model-load-optimizer" ]; then
-            cp -r /tmp/claw-setup-tmp/model-load-optimizer "$PLUGIN_DIR"
-            rm -rf /tmp/claw-setup-tmp
-        else
-            mkdir -p "$PLUGIN_DIR"
-            echo "  WARNING: model-load-optimizer not found in repo."
+        git clone https://github.com/suhteevah/model-load-optimizer.git "$PLUGIN_DIR" 2>/dev/null
+        if [ ! -f "$PLUGIN_DIR/package.json" ]; then
+            echo "  WARNING: Clone failed. Create $PLUGIN_DIR manually and retry."
         fi
     fi
 

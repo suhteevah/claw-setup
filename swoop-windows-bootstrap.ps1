@@ -3,7 +3,7 @@
 # Self-contained: download and run. All dependencies embedded inline.
 #
 # Usage (PowerShell as Administrator):
-#   irm https://raw.githubusercontent.com/suhteevah/claw-setup/main/swoop-windows.ps1 | iex
+#   irm https://raw.githubusercontent.com/suhteevah/claw-setup/main/swoop-windows-bootstrap.ps1 | iex
 #   OR: .\swoop-windows-bootstrap.ps1
 #
 # Role: Interactive Claude Code + icecream build worker (via WSL)
@@ -283,13 +283,9 @@ if ($script:OllamaInstalled) {
     # Clone and build the optimizer plugin
     if (-not (Test-Path $pluginDir)) {
         Write-Host "  Cloning model-load-optimizer..." -ForegroundColor White
-        git clone https://github.com/suhteevah/claw-setup.git "$env:TEMP\claw-setup-tmp" 2>$null
-        if (Test-Path "$env:TEMP\claw-setup-tmp\model-load-optimizer") {
-            Copy-Item -Recurse "$env:TEMP\claw-setup-tmp\model-load-optimizer" $pluginDir
-            Remove-Item -Recurse -Force "$env:TEMP\claw-setup-tmp" 2>$null
-        } else {
-            New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null
-            Write-Host "  WARNING: model-load-optimizer not found in repo. Plugin dir created but empty." -ForegroundColor Yellow
+        git clone https://github.com/suhteevah/model-load-optimizer.git $pluginDir 2>$null
+        if (-not (Test-Path "$pluginDir\package.json")) {
+            Write-Host "  WARNING: Clone failed. Create $pluginDir manually and retry." -ForegroundColor Yellow
         }
     }
 
