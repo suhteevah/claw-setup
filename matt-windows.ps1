@@ -278,113 +278,173 @@ try {
     Write-Host "  WARNING: Could not query GPU info: $_" -ForegroundColor Yellow
 }
 
+# --- Detect system RAM for hybrid GPU+CPU model selection ---
+$systemRamGB = 0
+try {
+    $systemRamGB = [math]::Round((Get-CimInstance -ClassName Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 0)
+} catch {}
+Write-Host "  System RAM: ${systemRamGB} GB DDR5" -ForegroundColor Cyan
+
 if ($gpus.Count -eq 0) {
-    Write-Host "  No discrete GPU detected. Skipping Ollama." -ForegroundColor Yellow
+    Write-Host "  No discrete GPU detected." -ForegroundColor Yellow
+    # Even without GPU, 64GB+ RAM can run CPU-only models
+    if ($systemRamGB -ge 32) {
+        Write-Host "  But with ${systemRamGB}GB RAM, CPU-only models are viable." -ForegroundColor White
+    } else {
+        Write-Host "  Skipping Ollama." -ForegroundColor Yellow
+    }
 } else {
     $bestGpu = $gpus | Sort-Object VRAM_GB -Descending | Select-Object -First 1
+    Write-Host "  GPU:        $($bestGpu.Vendor) $($bestGpu.Name) -- $($bestGpu.VRAM_GB) GB VRAM" -ForegroundColor Cyan
+}
+
+# Compute effective capacity: VRAM + RAM available for partial offload
+# Ollama auto-splits layers between GPU and RAM when model exceeds VRAM
+$effectiveVram = if ($bestGpu) { $bestGpu.VRAM_GB } else { 0 }
+$ramBudget = [math]::Max(0, $systemRamGB - 16)  # reserve 16GB for OS + apps
+$effectiveCapacity = $effectiveVram + $ramBudget
+Write-Host "  Effective model capacity: ${effectiveCapacity} GB (${effectiveVram}GB VRAM + ${ramBudget}GB RAM)" -ForegroundColor Cyan
+
+if ($effectiveCapacity -lt 2) {
+    Write-Host "  Not enough capacity for any model. Skipping Ollama." -ForegroundColor Yellow
+} else {
+    # =========================================================================
+    # Hybrid tiered selection: GPU primary + CPU sidecar
+    # With 64GB+ RAM and a GPU, we can partial-offload larger models
+    # Ollama handles the GPU/CPU split automatically per-layer
+    # =========================================================================
+
+    # Primary model: biggest model that fits in VRAM+RAM combined
+    $primaryModel = $null
+    if ($effectiveCapacity -ge 20) {
+        # 20GB+ effective = can run 16B with GPU acceleration on first layers
+        $primaryModel = @{ Model = "deepseek-coder-v2:16b"; Tier = "Large (GPU+RAM hybrid)"; Desc = "16B params, partial GPU offload, ~20-30 tok/s"; SizeGB = 9.5 }
+    } elseif ($effectiveCapacity -ge 12) {
+        $primaryModel = @{ Model = "deepseek-coder-v2:16b"; Tier = "Large (GPU+RAM hybrid)"; Desc = "16B params, most layers on GPU"; SizeGB = 9.5 }
+    } elseif ($effectiveCapacity -ge 8) {
+        $primaryModel = @{ Model = "deepseek-coder-v2:lite"; Tier = "Medium"; Desc = "Lite variant, fits entirely in VRAM"; SizeGB = 5 }
+    } elseif ($effectiveCapacity -ge 4) {
+        $primaryModel = @{ Model = "deepseek-coder:6.7b"; Tier = "Medium-Small"; Desc = "6.7B params, solid code quality"; SizeGB = 4 }
+    } elseif ($effectiveCapacity -ge 2) {
+        $primaryModel = @{ Model = "qwen2.5-coder:1.5b"; Tier = "Small"; Desc = "1.5B params, fast"; SizeGB = 1 }
+    }
+
+    # CPU sidecar: fast model that runs entirely in RAM for parallel requests
+    $sidecarModel = $null
+    if ($systemRamGB -ge 32 -and $primaryModel) {
+        $sidecarModel = @{ Model = "qwen2.5-coder:7b"; Tier = "CPU sidecar"; Desc = "Runs in DDR5, ~15-20 tok/s, no GPU contention"; SizeGB = 4.5 }
+    }
+
     Write-Host ""
-    Write-Host "  GPU: $($bestGpu.Vendor) $($bestGpu.Name) -- $($bestGpu.VRAM_GB) GB VRAM" -ForegroundColor Cyan
+    if ($primaryModel) {
+        Write-Host "  Primary model (GPU+RAM): $($primaryModel.Model) ($($primaryModel.Tier))" -ForegroundColor Green
+        Write-Host "    $($primaryModel.Desc)" -ForegroundColor Gray
+    }
+    if ($sidecarModel) {
+        Write-Host "  Sidecar model (CPU-only): $($sidecarModel.Model) ($($sidecarModel.Tier))" -ForegroundColor Green
+        Write-Host "    $($sidecarModel.Desc)" -ForegroundColor Gray
+    }
 
-    if ($bestGpu.VRAM_GB -lt 2) {
-        Write-Host "  VRAM too low. Skipping Ollama." -ForegroundColor Yellow
+    # Install Ollama if not present
+    if (-not $ollamaCmd) {
+        Write-Host ""
+        Write-Host "  Downloading Ollama installer..." -ForegroundColor White
+        $installerPath = "$env:TEMP\OllamaSetup.exe"
+        try {
+            Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile $installerPath -UseBasicParsing
+            Start-Process -FilePath $installerPath -ArgumentList "/SILENT" -Wait -NoNewWindow
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        } catch {
+            Write-Host "  ERROR: Install Ollama manually: https://ollama.com/download" -ForegroundColor Red
+        }
     } else {
-        # Tiered model selection
-        $modelInfo = $null
-        if ($bestGpu.VRAM_GB -ge 12) {
-            $modelInfo = @{ Model = "deepseek-coder-v2:16b"; Tier = "Large"; Desc = "16B params, best quality" }
-        } elseif ($bestGpu.VRAM_GB -ge 8) {
-            $modelInfo = @{ Model = "deepseek-coder-v2:lite"; Tier = "Medium"; Desc = "Lite variant, balanced" }
-        } elseif ($bestGpu.VRAM_GB -ge 4) {
-            $modelInfo = @{ Model = "deepseek-coder:6.7b"; Tier = "Medium-Small"; Desc = "6.7B params, solid" }
-        } elseif ($bestGpu.VRAM_GB -ge 2) {
-            $modelInfo = @{ Model = "qwen2.5-coder:1.5b"; Tier = "Small"; Desc = "1.5B params, fast" }
+        Write-Host "  Ollama already installed, skipping download." -ForegroundColor Green
+    }
+
+    # Resolve the working ollama executable
+    $ollamaExe = $null
+    try { $ollamaExe = (Get-Command ollama -ErrorAction Stop).Source } catch {}
+    if (-not $ollamaExe) {
+        foreach ($p in $ollamaSearchPaths) {
+            if (Test-Path $p) { $ollamaExe = $p; break }
+        }
+    }
+
+    if ($ollamaExe) {
+        # Ensure server is running
+        $ollamaProc = Get-Process ollama -ErrorAction SilentlyContinue
+        if (-not $ollamaProc) {
+            Start-Process $ollamaExe -ArgumentList "serve" -WindowStyle Hidden
+            Start-Sleep -Seconds 3
         }
 
-        if ($modelInfo) {
-            Write-Host "  Recommended model: $($modelInfo.Model) ($($modelInfo.Tier))" -ForegroundColor Green
-
-            # Install Ollama if not present
-            if (-not $ollamaCmd) {
-                Write-Host "  Downloading Ollama installer..." -ForegroundColor White
-                $installerPath = "$env:TEMP\OllamaSetup.exe"
-                try {
-                    Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile $installerPath -UseBasicParsing
-                    Start-Process -FilePath $installerPath -ArgumentList "/SILENT" -Wait -NoNewWindow
-                    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-                } catch {
-                    Write-Host "  ERROR: Install Ollama manually: https://ollama.com/download" -ForegroundColor Red
-                }
+        # --- Pull primary model ---
+        if ($primaryModel) {
+            $alreadyHasPrimary = $existingModels | Where-Object { $_ -like "$($primaryModel.Model)*" }
+            if ($alreadyHasPrimary) {
+                Write-Host "  $($primaryModel.Model) already pulled!" -ForegroundColor Green
+                $script:OllamaInstalled = $true
+                $script:OllamaModel = $primaryModel.Model
             } else {
-                Write-Host "  Ollama already installed, skipping download." -ForegroundColor Green
-            }
-
-            # Resolve the working ollama executable
-            $ollamaExe = $null
-            try { $ollamaExe = (Get-Command ollama -ErrorAction Stop).Source } catch {}
-            if (-not $ollamaExe) {
-                foreach ($p in $ollamaSearchPaths) {
-                    if (Test-Path $p) { $ollamaExe = $p; break }
-                }
-            }
-
-            if ($ollamaExe) {
-                # Ensure server is running
-                $ollamaProc = Get-Process ollama -ErrorAction SilentlyContinue
-                if (-not $ollamaProc) {
-                    Start-Process $ollamaExe -ArgumentList "serve" -WindowStyle Hidden
-                    Start-Sleep -Seconds 3
-                }
-
-                # Check if recommended model is already pulled
-                $recommendedAlreadyPulled = $existingModels | Where-Object { $_ -like "$($modelInfo.Model)*" }
-
-                if ($recommendedAlreadyPulled) {
-                    Write-Host "  $($modelInfo.Model) is already pulled!" -ForegroundColor Green
-                    $script:OllamaInstalled = $true
-                    $script:OllamaModel = $modelInfo.Model
-                } else {
-                    # Show existing models and offer upgrade
-                    if ($existingModels.Count -gt 0) {
-                        Write-Host ""
-                        Write-Host "  You already have models installed. Your GPU can handle:" -ForegroundColor White
-                        Write-Host "    $($modelInfo.Model) ($($modelInfo.Desc))" -ForegroundColor Green
-                        Write-Host ""
-                        $pullChoice = Read-Host "  Pull $($modelInfo.Model) as well? (y/n, keeps existing models)"
-                    } else {
-                        $pullChoice = "y"
-                    }
-
-                    if ($pullChoice -eq "y" -or $pullChoice -eq "Y" -or $pullChoice -eq "yes") {
-                        Write-Host "  Pulling $($modelInfo.Model)... (may take a while)" -ForegroundColor White
-                        & $ollamaExe pull $modelInfo.Model
-                        if ($LASTEXITCODE -eq 0) {
-                            $script:OllamaInstalled = $true
-                            $script:OllamaModel = $modelInfo.Model
-                            Write-Host "  Model ready!" -ForegroundColor Green
-                        }
-                    } else {
-                        Write-Host "  Keeping existing models only." -ForegroundColor Gray
-                        # Use the first existing model
-                        if ($existingModels.Count -gt 0) {
-                            $script:OllamaInstalled = $true
-                            $script:OllamaModel = $existingModels[0]
-                        }
-                    }
-                }
-
-                # List all available models at the end
-                if ($existingModels.Count -gt 0 -or $script:OllamaInstalled) {
+                if ($existingModels.Count -gt 0) {
                     Write-Host ""
-                    Write-Host "  All available models on this machine:" -ForegroundColor Cyan
-                    try {
-                        $finalList = & $ollamaExe list 2>$null
-                        $finalList | ForEach-Object {
-                            if ($_ -notmatch "^NAME") { Write-Host "    $_" -ForegroundColor White }
-                        }
-                    } catch {}
+                    Write-Host "  Your ${systemRamGB}GB RAM + $($bestGpu.VRAM_GB)GB VRAM can handle:" -ForegroundColor White
+                    Write-Host "    $($primaryModel.Model) -- $($primaryModel.Desc)" -ForegroundColor Green
+                    Write-Host "  Ollama auto-splits layers: GPU handles what fits, RAM handles the rest." -ForegroundColor Gray
+                    Write-Host ""
+                    $pullChoice = Read-Host "  Pull $($primaryModel.Model)? (y/n, keeps existing models)"
+                } else {
+                    $pullChoice = "y"
+                }
+
+                if ($pullChoice -match "^[yY]") {
+                    Write-Host "  Pulling $($primaryModel.Model)... (~$($primaryModel.SizeGB)GB download)" -ForegroundColor White
+                    & $ollamaExe pull $primaryModel.Model
+                    if ($LASTEXITCODE -eq 0) {
+                        $script:OllamaInstalled = $true
+                        $script:OllamaModel = $primaryModel.Model
+                        Write-Host "  Primary model ready!" -ForegroundColor Green
+                    }
+                } else {
+                    if ($existingModels.Count -gt 0) {
+                        $script:OllamaInstalled = $true
+                        $script:OllamaModel = $existingModels[0]
+                    }
                 }
             }
         }
+
+        # --- Pull sidecar model ---
+        if ($sidecarModel) {
+            $alreadyHasSidecar = $existingModels | Where-Object { $_ -like "$($sidecarModel.Model)*" }
+            if ($alreadyHasSidecar) {
+                Write-Host "  $($sidecarModel.Model) already pulled (CPU sidecar ready)!" -ForegroundColor Green
+                $script:OllamaSidecar = $sidecarModel.Model
+            } else {
+                Write-Host ""
+                Write-Host "  Also recommended: $($sidecarModel.Model) as CPU-only sidecar" -ForegroundColor White
+                Write-Host "    Runs entirely in DDR5, handles parallel requests without touching GPU" -ForegroundColor Gray
+                $sidecarChoice = Read-Host "  Pull $($sidecarModel.Model) as sidecar? (y/n)"
+                if ($sidecarChoice -match "^[yY]") {
+                    Write-Host "  Pulling $($sidecarModel.Model)... (~$($sidecarModel.SizeGB)GB download)" -ForegroundColor White
+                    & $ollamaExe pull $sidecarModel.Model
+                    if ($LASTEXITCODE -eq 0) {
+                        $script:OllamaSidecar = $sidecarModel.Model
+                        Write-Host "  Sidecar model ready!" -ForegroundColor Green
+                    }
+                }
+            }
+        }
+
+        # --- List all models ---
+        Write-Host ""
+        Write-Host "  All models on this machine:" -ForegroundColor Cyan
+        try {
+            $finalList = & $ollamaExe list 2>$null
+            $finalList | ForEach-Object {
+                if ($_ -notmatch "^NAME") { Write-Host "    $_" -ForegroundColor White }
+            }
+        } catch {}
     }
 }
 
@@ -410,8 +470,9 @@ Write-Host @"
 
 "@
 
+Write-Host "  RAM:    ${systemRamGB} GB DDR5" -ForegroundColor Cyan
 if ($bestGpu) {
-    Write-Host "  GPU:    $($bestGpu.Vendor) $($bestGpu.Name) ($($bestGpu.VRAM_GB) GB)" -ForegroundColor Cyan
+    Write-Host "  GPU:    $($bestGpu.Vendor) $($bestGpu.Name) ($($bestGpu.VRAM_GB) GB VRAM)" -ForegroundColor Cyan
 }
 
 if ($schedulerHost) {
@@ -422,10 +483,15 @@ if ($schedulerHost) {
 }
 
 if ($script:OllamaInstalled) {
-    Write-Host "  Ollama: $($script:OllamaModel)" -ForegroundColor Green
-    Write-Host "  Test:   ollama run $($script:OllamaModel) 'Hello world in C'" -ForegroundColor Gray
-} else {
-    Write-Host "  Ollama: not installed" -ForegroundColor Gray
+    Write-Host "  Ollama: $($script:OllamaModel) (GPU primary)" -ForegroundColor Green
+    Write-Host "  Test:   ollama run $($script:OllamaModel) 'Write a hello world in C'" -ForegroundColor Gray
+}
+if ($script:OllamaSidecar) {
+    Write-Host "  Sidecar: $($script:OllamaSidecar) (CPU/DDR5, parallel)" -ForegroundColor Green
+    Write-Host "  Test:   ollama run $($script:OllamaSidecar) 'Write a hello world in C'" -ForegroundColor Gray
+}
+if (-not $script:OllamaInstalled -and -not $script:OllamaSidecar) {
+    Write-Host "  Ollama: not configured" -ForegroundColor Gray
 }
 
 Write-Host @"
@@ -434,6 +500,9 @@ Usage:
   claude                  Interactive Claude Code
   claude -p "task"        One-shot task
   tailscale status        Check mesh network
+
+  Ollama auto-splits large models across GPU + DDR5.
+  Sidecar model runs entirely in RAM for parallel requests.
 
 This machine is your powerhouse workstation.
 Claude Code runs interactively with you at the keyboard.
