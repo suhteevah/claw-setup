@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.icecc.iceccd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/sbin/iceccd</string>
+    <string>-s</string>
+    <!-- Change this to your orchestrator's Tailscale hostname -->
+    <string>arch-orchestrator</string>
+    <string>-u</string>
+    <string>icecc</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/iceccd.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/iceccd.err</string>
+</dict>
+</plist>

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.claude.agentapi</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/agentapi</string>
+    <string>server</string>
+    <string>--type</string>
+    <string>claude</string>
+    <string>--allowed-hosts</string>
+    <string>*</string>
+    <string>--</string>
+    <string>claude</string>
+    <string>--dangerously-skip-permissions</string>
+    <string>--max-budget-usd</string>
+    <string>10.00</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Replace __ANTHROPIC_API_KEY__ with your actual key -->
+    <!-- The setup script does this substitution automatically -->
+    <key>ANTHROPIC_API_KEY</key>
+    <string>__ANTHROPIC_API_KEY__</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/claude-agentapi.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/claude-agentapi.err</string>
+</dict>
+</plist>

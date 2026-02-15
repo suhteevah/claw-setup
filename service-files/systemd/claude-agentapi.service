@@ -1,0 +1,22 @@
+[Unit]
+Description=Claude Code AgentAPI
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude-agent
+WorkingDirectory=/home/claude-agent
+EnvironmentFile=/etc/claude/api-key
+ExecStart=/usr/local/bin/agentapi server --type claude -- claude \
+  --dangerously-skip-permissions \
+  --max-budget-usd 10.00
+Restart=always
+RestartSec=10
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-agentapi
+
+[Install]
+WantedBy=multi-user.target

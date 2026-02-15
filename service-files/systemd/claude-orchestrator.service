@@ -1,0 +1,22 @@
+[Unit]
+Description=Claude Code Orchestrator (claude-code-by-agents)
+After=network-online.target claude-agentapi.service tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude-agent
+WorkingDirectory=/opt/claude-code-by-agents/backend
+EnvironmentFile=/etc/claude/api-key
+Environment="DENO_DIR=/home/claude-agent/.deno"
+Environment="PATH=/home/claude-agent/.deno/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/claude-agent/.deno/bin/deno task dev
+Restart=always
+RestartSec=10
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-orchestrator
+
+[Install]
+WantedBy=multi-user.target
