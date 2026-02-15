@@ -18,7 +18,7 @@ set -euo pipefail
 #   - Podman toolbox for mutable dev workloads (Node.js, Deno, Claude Code)
 #   - Claude Code + AgentAPI (headless AI agent)
 #   - claude-code-by-agents orchestrator (multi-agent dispatch)
-#   - Ollama LLM server (if GPU detected)
+#   - Ollama LLM server (if GPU detected, otherwise uses LAN Ollama)
 #   - Model Load Optimizer plugin (intelligent model routing)
 #   - OpenClaw gateway (chat + Discord + dashboard)
 #   - Firewalld rules for all services
@@ -37,7 +37,7 @@ set -euo pipefail
 #   - openSUSE MicroOS (fresh install, SSH enabled)
 #   - Internet connection
 #   - Anthropic API key (get one at https://console.anthropic.com)
-#   - (Optional) NVIDIA GPU for local LLM inference
+#   - (Optional) Discrete GPU for local LLM inference (defaults to LAN Ollama at 192.168.10.242)
 #
 # Post-install:
 #   MicroOS is atomic — most package installs require a reboot to take effect.
@@ -136,11 +136,9 @@ if [ "$CURRENT_PHASE" -le 1 ]; then
         info "Auto-detected: ${TOTAL_CORES} cores, reserving 2 → ${MAX_JOBS} compile jobs"
     fi
 
-    read -p "LAN Ollama server IP (press Enter to skip, or e.g. 192.168.10.242): " LAN_OLLAMA_IP
-    LAN_OLLAMA_URL=""
-    if [ -n "$LAN_OLLAMA_IP" ]; then
-        LAN_OLLAMA_URL="http://${LAN_OLLAMA_IP}:11434"
-    fi
+    read -p "LAN Ollama server IP [192.168.10.242]: " LAN_OLLAMA_IP
+    LAN_OLLAMA_IP="${LAN_OLLAMA_IP:-192.168.10.242}"
+    LAN_OLLAMA_URL="http://${LAN_OLLAMA_IP}:11434"
 
     GPU_NAME=""
     GPU_VRAM_GB=0
@@ -327,62 +325,110 @@ if [ "$CURRENT_PHASE" -le 4 ]; then
         fi
     fi
 
-    [ -z "$GPU_VENDOR" ] && info "No discrete GPU detected. CPU-only inference."
+    if [ -z "$GPU_VENDOR" ]; then
+        info "No discrete GPU detected (Intel onboard only)."
+        info "This machine is best as an orchestrator, not an inference node."
+        echo ""
 
-    # Install Ollama
-    if ! command -v ollama &>/dev/null; then
-        info "Installing Ollama..."
-        curl -fsSL https://ollama.com/install.sh | sh
-    fi
-
-    systemctl enable --now ollama 2>/dev/null || {
-        warn "Ollama service not found. Starting manually."
-        ollama serve &>/dev/null &
-        sleep 3
-    }
-
-    # Model selection
-    if [ "$GPU_VRAM_GB" -ge 12 ]; then
-        SELECTED_MODEL="deepseek-coder-v2:16b"
-        SIDECAR_MODEL="qwen2.5-coder:7b"
-        info "GPU tier: Large — primary + sidecar"
-    elif [ "$GPU_VRAM_GB" -ge 8 ]; then
-        SELECTED_MODEL="qwen2.5-coder:7b"
-        SIDECAR_MODEL="deepseek-coder-v2:lite"
-        info "GPU tier: Medium — primary + lite sidecar"
-    elif [ "$GPU_VRAM_GB" -ge 4 ]; then
-        SELECTED_MODEL="qwen2.5-coder:7b"
-        SIDECAR_MODEL=""
-        info "GPU tier: Small — primary only"
+        if [ -n "$LAN_OLLAMA_URL" ]; then
+            ok "Will use LAN Ollama at ${LAN_OLLAMA_URL} for inference"
+            SELECTED_MODEL="qwen2.5-coder:7b"
+            SIDECAR_MODEL=""
+            OLLAMA_INSTALLED=0
+            OLLAMA_MODEL=""
+        else
+            echo "  No discrete GPU and no LAN Ollama configured."
+            echo "  Options:"
+            echo "    1) Skip local Ollama — use only remote API (anthropic/claude-sonnet-4-5)"
+            echo "    2) Install Ollama anyway (CPU-only, will be slow)"
+            echo "    3) Specify a LAN Ollama server now"
+            echo ""
+            read -p "  Choice [1/2/3]: " OLLAMA_CHOICE
+            case "${OLLAMA_CHOICE}" in
+                2)
+                    info "Installing Ollama for CPU-only inference..."
+                    INSTALL_LOCAL_OLLAMA=1
+                    ;;
+                3)
+                    read -p "  LAN Ollama IP (e.g. 192.168.10.242): " LAN_OLLAMA_IP
+                    LAN_OLLAMA_URL="http://${LAN_OLLAMA_IP}:11434"
+                    ok "Will use LAN Ollama at ${LAN_OLLAMA_URL}"
+                    SELECTED_MODEL="qwen2.5-coder:7b"
+                    SIDECAR_MODEL=""
+                    OLLAMA_INSTALLED=0
+                    OLLAMA_MODEL=""
+                    INSTALL_LOCAL_OLLAMA=0
+                    ;;
+                *)
+                    info "Skipping local Ollama. Will use anthropic/claude-sonnet-4-5 as primary."
+                    SELECTED_MODEL=""
+                    SIDECAR_MODEL=""
+                    OLLAMA_INSTALLED=0
+                    OLLAMA_MODEL=""
+                    INSTALL_LOCAL_OLLAMA=0
+                    ;;
+            esac
+        fi
     else
-        SELECTED_MODEL="qwen2.5-coder:7b"
-        SIDECAR_MODEL=""
-        info "No GPU / low VRAM — CPU model"
+        INSTALL_LOCAL_OLLAMA=1
     fi
 
-    info "Pulling ${SELECTED_MODEL}... (may take a while)"
-    if ollama pull "$SELECTED_MODEL" 2>/dev/null; then
-        OLLAMA_INSTALLED=1
-        OLLAMA_MODEL="$SELECTED_MODEL"
-        ok "Primary: ${SELECTED_MODEL}"
-    else
-        warn "Failed to pull ${SELECTED_MODEL}"
-    fi
+    # Install Ollama if we have a GPU or user explicitly opted in
+    if [ "${INSTALL_LOCAL_OLLAMA:-1}" = "1" ]; then
+        if ! command -v ollama &>/dev/null; then
+            info "Installing Ollama..."
+            curl -fsSL https://ollama.com/install.sh | sh
+        fi
 
-    if [ -n "$SIDECAR_MODEL" ]; then
-        info "Pulling sidecar: ${SIDECAR_MODEL}..."
-        ollama pull "$SIDECAR_MODEL" 2>/dev/null && ok "Sidecar: ${SIDECAR_MODEL}" || warn "Failed to pull sidecar"
-    fi
+        systemctl enable --now ollama 2>/dev/null || {
+            warn "Ollama service not found. Starting manually."
+            ollama serve &>/dev/null &
+            sleep 3
+        }
 
-    # Expose Ollama to LAN
-    mkdir -p /etc/systemd/system/ollama.service.d
-    cat > /etc/systemd/system/ollama.service.d/override.conf << 'EOF'
+        # Model selection based on VRAM
+        if [ "$GPU_VRAM_GB" -ge 12 ]; then
+            SELECTED_MODEL="deepseek-coder-v2:16b"
+            SIDECAR_MODEL="qwen2.5-coder:7b"
+            info "GPU tier: Large — primary + sidecar"
+        elif [ "$GPU_VRAM_GB" -ge 8 ]; then
+            SELECTED_MODEL="qwen2.5-coder:7b"
+            SIDECAR_MODEL="deepseek-coder-v2:lite"
+            info "GPU tier: Medium — primary + lite sidecar"
+        elif [ "$GPU_VRAM_GB" -ge 4 ]; then
+            SELECTED_MODEL="qwen2.5-coder:7b"
+            SIDECAR_MODEL=""
+            info "GPU tier: Small — primary only"
+        else
+            SELECTED_MODEL="qwen2.5-coder:7b"
+            SIDECAR_MODEL=""
+            info "CPU-only — lightweight model"
+        fi
+
+        info "Pulling ${SELECTED_MODEL}... (may take a while)"
+        if ollama pull "$SELECTED_MODEL" 2>/dev/null; then
+            OLLAMA_INSTALLED=1
+            OLLAMA_MODEL="$SELECTED_MODEL"
+            ok "Primary: ${SELECTED_MODEL}"
+        else
+            warn "Failed to pull ${SELECTED_MODEL}"
+        fi
+
+        if [ -n "$SIDECAR_MODEL" ]; then
+            info "Pulling sidecar: ${SIDECAR_MODEL}..."
+            ollama pull "$SIDECAR_MODEL" 2>/dev/null && ok "Sidecar: ${SIDECAR_MODEL}" || warn "Failed to pull sidecar"
+        fi
+
+        # Expose Ollama to LAN
+        mkdir -p /etc/systemd/system/ollama.service.d
+        cat > /etc/systemd/system/ollama.service.d/override.conf << 'EOF'
 [Service]
 Environment="OLLAMA_HOST=0.0.0.0"
 EOF
-    systemctl daemon-reload
-    systemctl restart ollama
-    ok "Ollama exposed on 0.0.0.0:11434 (LAN accessible)"
+        systemctl daemon-reload
+        systemctl restart ollama
+        ok "Ollama exposed on 0.0.0.0:11434 (LAN accessible)"
+    fi
 
     save_state 5
 fi
@@ -510,41 +556,62 @@ if [ "$CURRENT_PHASE" -le 8 ]; then
         warn "Plugin clone failed. Install manually later."
     fi
 
-    # Best Ollama endpoint
+    # Determine best Ollama endpoint and model config
     OPTIMIZER_OLLAMA_HOST="http://localhost:11434"
     if [ "$OLLAMA_INSTALLED" != "1" ] && [ -n "$LAN_OLLAMA_URL" ]; then
         OPTIMIZER_OLLAMA_HOST="$LAN_OLLAMA_URL"
     fi
 
-    PRIMARY_MODEL="${OLLAMA_MODEL:-qwen2.5-coder:7b}"
-    SIDECAR_CFG_MODEL="${SIDECAR_MODEL:-}"
+    # Build OpenClaw config based on what's available
+    if [ "$OLLAMA_INSTALLED" = "1" ] || [ -n "$LAN_OLLAMA_URL" ]; then
+        # Ollama available (local or LAN) — use it as primary
+        PRIMARY_MODEL="${OLLAMA_MODEL:-qwen2.5-coder:7b}"
+        PRIMARY_REF="ollama/${PRIMARY_MODEL}"
+        SIDECAR_CFG_MODEL="${SIDECAR_MODEL:-}"
 
-    SIDECAR_MODELS_JSON=""
-    SIDECAR_FALLBACK_JSON=""
-    SIDECAR_OPT_JSON='"sidecarModel": "",'
-    if [ -n "$SIDECAR_CFG_MODEL" ]; then
-        SIDECAR_MODELS_JSON="\"ollama/${SIDECAR_CFG_MODEL}\": { \"alias\": \"sidecar\" },"
-        SIDECAR_FALLBACK_JSON="\"ollama/${SIDECAR_CFG_MODEL}\","
-        SIDECAR_OPT_JSON="\"sidecarModel\": \"${SIDECAR_CFG_MODEL}\","
+        SIDECAR_MODELS_JSON=""
+        SIDECAR_FALLBACK_JSON=""
+        SIDECAR_OPT_JSON='"sidecarModel": "",'
+        OPTIMIZER_PRIMARY="${PRIMARY_MODEL}"
+        OPTIMIZER_PRELOAD="true"
+
+        if [ -n "$SIDECAR_CFG_MODEL" ]; then
+            SIDECAR_MODELS_JSON="\"ollama/${SIDECAR_CFG_MODEL}\": { \"alias\": \"sidecar\" },"
+            SIDECAR_FALLBACK_JSON="\"ollama/${SIDECAR_CFG_MODEL}\","
+            SIDECAR_OPT_JSON="\"sidecarModel\": \"${SIDECAR_CFG_MODEL}\","
+        fi
+
+        OLLAMA_ENV_JSON='"OLLAMA_API_KEY": "ollama-local"'
+        OLLAMA_AUTH_JSON='"ollama:default": { "provider": "ollama", "mode": "api_key" }'
+    else
+        # No Ollama anywhere — pure Anthropic API
+        PRIMARY_REF="anthropic/claude-sonnet-4-5"
+        SIDECAR_MODELS_JSON=""
+        SIDECAR_FALLBACK_JSON=""
+        SIDECAR_OPT_JSON='"sidecarModel": "",'
+        OPTIMIZER_PRIMARY=""
+        OPTIMIZER_PRELOAD="false"
+        OLLAMA_ENV_JSON=""
+        OLLAMA_AUTH_JSON=""
+        info "No Ollama configured — using Anthropic API as primary"
     fi
 
     sudo -u claude-agent tee "$OPENCLAW_DIR/openclaw.json" > /dev/null << OCEOF
 {
-  "env": { "OLLAMA_API_KEY": "ollama-local" },
+  "env": { ${OLLAMA_ENV_JSON} },
   "auth": {
     "profiles": {
-      "anthropic:default": { "provider": "anthropic", "mode": "api_key" },
-      "ollama:default": { "provider": "ollama", "mode": "api_key" }
+      "anthropic:default": { "provider": "anthropic", "mode": "api_key" }$([ -n "$OLLAMA_AUTH_JSON" ] && echo ", $OLLAMA_AUTH_JSON")
     }
   },
   "agents": {
     "defaults": {
       "model": {
-        "primary": "ollama/${PRIMARY_MODEL}",
+        "primary": "${PRIMARY_REF}",
         "fallbacks": [${SIDECAR_FALLBACK_JSON} "anthropic/claude-sonnet-4-5"]
       },
       "models": {
-        "ollama/${PRIMARY_MODEL}": { "alias": "primary" },
+        "${PRIMARY_REF}": { "alias": "primary" },
         ${SIDECAR_MODELS_JSON}
         "anthropic/claude-sonnet-4-5": { "alias": "sonnet" }
       },
@@ -572,13 +639,13 @@ if [ "$CURRENT_PHASE" -le 8 ]; then
         "enabled": true,
         "config": {
           "ollamaHost": "${OPTIMIZER_OLLAMA_HOST}",
-          "primaryModel": "${PRIMARY_MODEL}",
+          "primaryModel": "${OPTIMIZER_PRIMARY}",
           ${SIDECAR_OPT_JSON}
           "fallbackModel": "anthropic/claude-sonnet-4-5",
           "keepAliveMinutes": 30,
           "gpuMemoryThreshold": 0.85,
           "healthCheckIntervalSec": 30,
-          "preloadOnStart": true,
+          "preloadOnStart": ${OPTIMIZER_PRELOAD},
           "autoRoute": true,
           "dashboardEnabled": true
         }
@@ -599,10 +666,16 @@ fi
 if [ "$CURRENT_PHASE" -le 9 ]; then
     phase "Phase 9: Systemd Services"
 
-    cat > /etc/systemd/system/claude-agentapi.service << 'EOF'
+        # Only depend on ollama.service if it's installed locally
+    OLLAMA_AFTER=""
+    if systemctl list-unit-files ollama.service &>/dev/null 2>&1; then
+        OLLAMA_AFTER=" ollama.service"
+    fi
+
+    cat > /etc/systemd/system/claude-agentapi.service << EOF
 [Unit]
 Description=Claude Code AgentAPI Server
-After=network-online.target tailscaled.service ollama.service
+After=network-online.target tailscaled.service${OLLAMA_AFTER}
 Wants=network-online.target
 
 [Service]
@@ -675,8 +748,10 @@ if [ "$CURRENT_PHASE" -le 10 ]; then
     firewall-cmd --permanent --add-port=8766/tcp   # telnet monitor
     firewall-cmd --permanent --add-port=10245/tcp  # worker
 
-    # Ollama (LAN access)
-    firewall-cmd --permanent --add-port=11434/tcp
+    # Ollama (only if running locally)
+    if systemctl list-unit-files ollama.service &>/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port=11434/tcp
+    fi
 
     # AgentAPI
     firewall-cmd --permanent --add-port=3284/tcp
@@ -716,7 +791,7 @@ check_svc() {
 check_svc "tailscaled"
 check_svc "icecc-scheduler"
 check_svc "iceccd"
-check_svc "ollama"
+systemctl list-unit-files ollama.service &>/dev/null 2>&1 && check_svc "ollama" || echo -e "  ${YELLOW}○${NC} ollama: not installed (using LAN: ${LAN_OLLAMA_URL:-none})"
 check_svc "claude-agentapi"
 check_svc "claude-orchestrator"
 check_svc "firewalld"
@@ -729,11 +804,13 @@ echo "  Hostname:     ${TS_HOSTNAME}"
 
 echo ""
 echo -e "${BOLD}Models:${NC}"
+echo "  Primary:  ${PRIMARY_REF:-anthropic/claude-sonnet-4-5}"
 if [ "$OLLAMA_INSTALLED" = "1" ]; then
-    echo "  Primary:  ollama/${PRIMARY_MODEL:-$OLLAMA_MODEL}"
     [ -n "${SIDECAR_MODEL:-}" ] && echo "  Sidecar:  ollama/${SIDECAR_MODEL}"
+    echo "  Source:   Local Ollama (localhost:11434)"
+elif [ -n "${LAN_OLLAMA_URL:-}" ]; then
+    echo "  Source:   LAN Ollama (${LAN_OLLAMA_URL})"
 fi
-[ -n "${LAN_OLLAMA_URL:-}" ] && echo "  LAN:      ${LAN_OLLAMA_URL}"
 echo "  Fallback: anthropic/claude-sonnet-4-5"
 
 echo ""
@@ -769,7 +846,11 @@ echo -e "${BOLD}Endpoints:${NC}"
 echo "  Orchestrator UI:  http://${TS_HOSTNAME}:8080"
 echo "  OpenClaw:         http://${TS_HOSTNAME}:18789"
 echo "  AgentAPI:         http://${TS_HOSTNAME}:3284"
-echo "  Ollama API:       http://${TS_HOSTNAME}:11434"
+if systemctl list-unit-files ollama.service &>/dev/null 2>&1; then
+    echo "  Ollama API:       http://${TS_HOSTNAME}:11434"
+else
+    echo "  Ollama API:       ${LAN_OLLAMA_URL:-not configured} (remote)"
+fi
 echo "  Icecream Monitor: telnet ${TS_HOSTNAME} 8766"
 echo ""
 
@@ -790,9 +871,11 @@ echo ""
 echo -e "${BOLD}Service management:${NC}"
 echo "  journalctl -u claude-agentapi -f     # Agent logs"
 echo "  journalctl -u claude-orchestrator -f  # Orchestrator logs"
-echo "  journalctl -u ollama -f               # Ollama logs"
+if systemctl list-unit-files ollama.service &>/dev/null 2>&1; then
+    echo "  journalctl -u ollama -f               # Ollama logs"
+    echo "  ollama list                            # Show pulled models"
+fi
 echo "  systemctl restart claude-agentapi     # Restart agent"
-echo "  ollama list                            # Show pulled models"
 echo "  tailscale status                       # Mesh status"
 echo ""
 
