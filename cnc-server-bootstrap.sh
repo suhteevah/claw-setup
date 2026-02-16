@@ -168,6 +168,16 @@ fi
 if [ "$CURRENT_PHASE" -le 1 ]; then
     phase "Phase 1: SSH + Transactional Update — Core Packages"
 
+    # ── Ensure SSH Config Exists (MicroOS Specific) ──
+    # MicroOS ships sshd_config in /usr/etc/ssh/ (vendor defaults).
+    # If /etc/ssh/sshd_config is missing, sshd won't start properly.
+    if [ ! -f /etc/ssh/sshd_config ] && [ -f /usr/etc/ssh/sshd_config ]; then
+        info "Restoring missing sshd_config from defaults..."
+        mkdir -p /etc/ssh
+        cp /usr/etc/ssh/sshd_config /etc/ssh/sshd_config
+        ok "Copied /usr/etc/ssh/sshd_config to /etc/ssh/sshd_config"
+    fi
+
     # ── Ensure SSH is enabled BEFORE reboot so we don't get locked out ──
     info "Ensuring SSH is enabled..."
     if systemctl is-enabled sshd &>/dev/null 2>&1; then
@@ -188,7 +198,7 @@ if [ "$CURRENT_PHASE" -le 1 ]; then
     fi
 
     # Make sure sshd is running RIGHT NOW (before reboot)
-    systemctl start sshd.service 2>/dev/null || systemctl start ssh.service 2>/dev/null || true
+    systemctl restart sshd.service 2>/dev/null || systemctl restart ssh.service 2>/dev/null || true
 
     # Open SSH port in firewall immediately (firewalld may already be running)
     if command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null 2>&1; then
@@ -200,6 +210,10 @@ if [ "$CURRENT_PHASE" -le 1 ]; then
     info "Installing core packages via transactional-update..."
     info "This creates a new btrfs snapshot — takes a minute."
 
+    # FIX:
+    # 1. Removed version numbers from nodejs/npm (Rolling release compatible)
+    # 2. Added 'unzip' (Required for Deno install)
+    # 3. Added 'tar' (Required for manual Ollama install)
     transactional-update --non-interactive pkg install \
         openssh-server \
         git curl wget jq htop tmux \
@@ -207,9 +221,10 @@ if [ "$CURRENT_PHASE" -le 1 ]; then
         ripgrep \
         icecream icecream-clang-wrappers \
         podman podman-docker distrobox \
-        nodejs20 npm20 \
+        nodejs npm \
         tailscale \
-        firewalld
+        firewalld \
+        unzip tar
 
     # Ensure sshd stays enabled in the new snapshot
     # (transactional-update runs in a chroot — enable it there too)
@@ -327,6 +342,8 @@ fi
 if [ "$CURRENT_PHASE" -le 4 ]; then
     phase "Phase 4: GPU Detection + Ollama"
 
+    INSTALL_LOCAL_OLLAMA=0
+
     # Detect NVIDIA
     if lspci 2>/dev/null | grep -qi nvidia; then
         info "NVIDIA GPU detected."
@@ -417,7 +434,7 @@ if [ "$CURRENT_PHASE" -le 4 ]; then
     fi
 
     # Install Ollama if we have a GPU or user explicitly opted in
-    if [ "${INSTALL_LOCAL_OLLAMA:-1}" = "1" ]; then
+    if [ "$INSTALL_LOCAL_OLLAMA" = "1" ]; then
         if ! command -v ollama &>/dev/null; then
             info "Installing Ollama..."
             curl -fsSL https://ollama.com/install.sh | sh
@@ -490,7 +507,7 @@ if [ "$CURRENT_PHASE" -le 5 ]; then
         mkdir -p /usr/local/lib/node_modules
         npm install --prefix /usr/local -g @anthropic-ai/claude-code
     }
-    CLAUDE_VER=$(claude --version 2>/dev/null || echo "installed")
+    CLAUDE_VER=$(/usr/local/bin/claude --version 2>/dev/null || echo "installed")
     ok "Claude Code: ${CLAUDE_VER}"
 
     # AgentAPI binary
@@ -522,26 +539,35 @@ if [ "$CURRENT_PHASE" -le 6 ]; then
 
     if [ ! -f /etc/claude/api-key ]; then
         echo ""
-        echo -e "${BOLD}You need an Anthropic API key.${NC}"
-        echo "  1. Go to: https://console.anthropic.com/"
-        echo "  2. Create or sign into your account"
-        echo "  3. Go to API Keys → Create new key"
+        echo -e "${BOLD}Anthropic API Key Configuration${NC}"
+        echo "  You can provide an API key now, or skip to authenticate via browser."
+        echo "  - If you have a key (sk-...), paste it below."
+        echo "  - To use browser authentication, just press Enter."
         echo ""
-        read -sp "Paste your Anthropic API key: " API_KEY
-        echo
-        echo "ANTHROPIC_API_KEY=${API_KEY}" > /etc/claude/api-key
+        read -sp "Anthropic API Key [leave blank for browser auth]: " API_KEY
+        echo ""
+
+        if [ -n "$API_KEY" ]; then
+            echo "ANTHROPIC_API_KEY=${API_KEY}" > /etc/claude/api-key
+            ok "API key saved to /etc/claude/api-key"
+        else
+            # Create empty file so systemd EnvironmentFile doesn't crash
+            touch /etc/claude/api-key
+            ok "No API key provided. Using browser authentication mode."
+        fi
+
         chmod 600 /etc/claude/api-key
         chown claude-agent:claude-agent /etc/claude/api-key
-        ok "API key saved to /etc/claude/api-key"
     else
-        ok "API key already configured"
+        ok "API key configuration already exists"
     fi
 
     echo ""
     echo -e "${BOLD}>>> Authenticate Claude Code:${NC}"
-    echo -e "    Run: ${CYAN}sudo -u claude-agent claude auth login${NC}"
+    echo -e "    Run this command in a NEW terminal window:"
+    echo -e "    ${CYAN}sudo -u claude-agent /usr/local/bin/claude auth login${NC}"
     echo ""
-    read -p "Press Enter after authenticating... "
+    read -p "Press Enter ONLY after you have completed authentication... "
 
     save_state 7
 fi
@@ -726,7 +752,7 @@ Type=simple
 User=claude-agent
 WorkingDirectory=/home/claude-agent
 EnvironmentFile=/etc/claude/api-key
-ExecStart=/usr/local/bin/agentapi server --type claude -- claude \
+ExecStart=/usr/local/bin/agentapi server --type claude -- /usr/local/bin/claude \
   --dangerously-skip-permissions \
   --max-budget-usd 10.00
 Restart=always
