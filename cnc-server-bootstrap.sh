@@ -544,11 +544,15 @@ if [ "$CURRENT_PHASE" -le 6 ]; then
     if [ ! -f /etc/claude/api-key ]; then
         echo ""
         echo -e "${BOLD}Anthropic API Key Configuration${NC}"
-        echo "  You can provide an API key now, or skip to authenticate via browser."
-        echo "  - If you have a key (sk-...), paste it below."
-        echo "  - To use browser authentication, just press Enter."
         echo ""
-        read -sp "Anthropic API Key [leave blank for browser auth]: " API_KEY
+        echo "  ${YELLOW}IMPORTANT: Headless servers REQUIRE an API key.${NC}"
+        echo "  The browser-based 'claude auth login' does NOT work over SSH."
+        echo ""
+        echo "  Get a key from:"
+        echo "    - Anthropic Console: https://console.anthropic.com/settings/keys"
+        echo "    - Claude Max sub:    https://claude.ai/settings/api"
+        echo ""
+        read -sp "Anthropic API Key (sk-ant-...): " API_KEY
         echo ""
 
         if [ -n "$API_KEY" ]; then
@@ -557,7 +561,8 @@ if [ "$CURRENT_PHASE" -le 6 ]; then
         else
             # Create empty file so systemd EnvironmentFile doesn't crash
             touch /etc/claude/api-key
-            ok "No API key provided. Using browser authentication mode."
+            warn "No API key provided. You MUST provide one before the agent can work."
+            echo "  Fix later: echo 'ANTHROPIC_API_KEY=sk-ant-...' > /etc/claude/api-key"
         fi
 
         chmod 600 /etc/claude/api-key
@@ -566,12 +571,67 @@ if [ "$CURRENT_PHASE" -le 6 ]; then
         ok "API key configuration already exists"
     fi
 
-    echo ""
-    echo -e "${BOLD}>>> Authenticate Claude Code:${NC}"
-    echo -e "    Run this command in a NEW terminal window:"
-    echo -e "    ${CYAN}sudo -u claude-agent /usr/local/bin/claude auth login${NC}"
-    echo ""
-    read -p "Press Enter ONLY after you have completed authentication... "
+    # ── Verify Claude Code can authenticate ──
+    # On headless servers, OAuth (claude auth login) is broken:
+    #   1. It gives you a URL to visit in a browser
+    #   2. You approve and get a return code
+    #   3. But the headless terminal can't receive the pasted code reliably
+    #
+    # The CORRECT approach for headless: just use the API key env var.
+    # Claude Code reads ANTHROPIC_API_KEY from the environment — no login needed.
+    # The systemd service already loads it via EnvironmentFile=/etc/claude/api-key.
+
+    if [ -s /etc/claude/api-key ] && grep -q "ANTHROPIC_API_KEY=" /etc/claude/api-key; then
+        # API key was provided — test it works
+        info "Testing Claude Code authentication with API key..."
+        if sudo -u claude-agent bash -c "source /etc/claude/api-key && /usr/local/bin/claude -p 'respond with exactly: OK' --output-format text" 2>/dev/null | grep -qi "OK"; then
+            ok "Claude Code authenticated via API key"
+        else
+            warn "Claude Code test call failed. The API key may be invalid."
+            echo "  You can fix this later by editing /etc/claude/api-key"
+            echo "  Format: ANTHROPIC_API_KEY=sk-ant-..."
+            read -p "  Continue anyway? [Y/n] " AUTH_CONTINUE
+            if [[ "${AUTH_CONTINUE,,}" == "n" ]]; then
+                exit 1
+            fi
+        fi
+    else
+        # No API key — they need one for headless operation
+        warn "No API key configured. Headless agents REQUIRE an API key."
+        echo ""
+        echo "  On a headless server, 'claude auth login' does NOT work reliably."
+        echo "  The OAuth flow requires pasting a return code, which fails over SSH."
+        echo ""
+        echo "  You have two options:"
+        echo "    1) Provide an Anthropic API key now (recommended)"
+        echo "       Get one at: https://console.anthropic.com/settings/keys"
+        echo ""
+        echo "    2) Use a Claude Max subscription key"
+        echo "       Get one at: https://claude.ai/settings/api"
+        echo ""
+        read -sp "  Paste your API key (sk-ant-...): " LATE_API_KEY
+        echo ""
+        if [ -n "$LATE_API_KEY" ]; then
+            echo "ANTHROPIC_API_KEY=${LATE_API_KEY}" > /etc/claude/api-key
+            chmod 600 /etc/claude/api-key
+            chown claude-agent:claude-agent /etc/claude/api-key
+            ok "API key saved"
+
+            info "Testing authentication..."
+            if sudo -u claude-agent bash -c "source /etc/claude/api-key && /usr/local/bin/claude -p 'respond with exactly: OK' --output-format text" 2>/dev/null | grep -qi "OK"; then
+                ok "Claude Code authenticated successfully"
+            else
+                warn "Test call failed — key may be invalid, but continuing."
+            fi
+        else
+            fail "No API key provided. The agent service will not work without one."
+            echo "  Fix later: echo 'ANTHROPIC_API_KEY=sk-ant-...' > /etc/claude/api-key"
+            read -p "  Continue anyway? [Y/n] " SKIP_AUTH
+            if [[ "${SKIP_AUTH,,}" == "n" ]]; then
+                exit 1
+            fi
+        fi
+    fi
 
     save_state 7
 fi
