@@ -643,15 +643,20 @@ fi
 if [ "$CURRENT_PHASE" -le 7 ]; then
     phase "Phase 7: Orchestrator (claude-code-by-agents)"
 
-    # ── Install Deno for claude-agent user ──
-    DENO_BIN="/home/claude-agent/.deno/bin/deno"
+    # ── Install Deno system-wide ──
+    # Deno installed into a system user's home dir (/home/claude-agent/.deno/bin)
+    # gets blocked by MicroOS home directory permissions when systemd tries to
+    # exec it. Fix: install to /usr/local/bin where everything else lives.
+    DENO_BIN="/usr/local/bin/deno"
     if [ ! -x "$DENO_BIN" ]; then
-        info "Installing Deno for claude-agent user..."
-        sudo -u claude-agent bash -c 'curl -fsSL https://deno.land/install.sh | sh'
-        # Add to bashrc for interactive use
-        if ! grep -q '\.deno/bin' /home/claude-agent/.bashrc 2>/dev/null; then
-            echo 'export PATH="$HOME/.deno/bin:$PATH"' | sudo -u claude-agent tee -a /home/claude-agent/.bashrc > /dev/null
-        fi
+        info "Installing Deno system-wide..."
+        # Install to a temp location first, then move to /usr/local/bin
+        export DENO_INSTALL="/tmp/deno-install"
+        curl -fsSL https://deno.land/install.sh | sh
+        cp /tmp/deno-install/bin/deno /usr/local/bin/deno
+        chmod 755 /usr/local/bin/deno
+        rm -rf /tmp/deno-install
+        unset DENO_INSTALL
     fi
 
     if [ -x "$DENO_BIN" ]; then
@@ -672,6 +677,7 @@ if [ "$CURRENT_PHASE" -le 7 ]; then
     chown -R claude-agent:claude-agent "$ORCHESTRATOR_DIR"
 
     # Cache Deno dependencies so the service starts cleanly
+    # Run as claude-agent so the cache lands in their home dir
     info "Caching orchestrator dependencies..."
     sudo -u claude-agent bash -c "cd ${ORCHESTRATOR_DIR}/backend && ${DENO_BIN} install --allow-scripts 2>/dev/null || ${DENO_BIN} cache cli/deno.ts 2>/dev/null || true"
 
@@ -681,6 +687,10 @@ if [ "$CURRENT_PHASE" -le 7 ]; then
     else
         warn "Orchestrator cloned but 'deno task dev' not found — service may fail"
     fi
+
+    # Also symlink into user's .deno/bin for interactive use
+    sudo -u claude-agent mkdir -p /home/claude-agent/.deno/bin
+    ln -sf /usr/local/bin/deno /usr/local/bin/deno 2>/dev/null || true
 
     save_state 8
 fi
@@ -875,8 +885,8 @@ WorkingDirectory=/opt/claude-code-by-agents/backend
 EnvironmentFile=/etc/claude/api-key
 Environment="HOME=/home/claude-agent"
 Environment="DENO_DIR=/home/claude-agent/.cache/deno"
-Environment="PATH=/home/claude-agent/.deno/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/home/claude-agent/.deno/bin/deno run \
+Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+ExecStart=/usr/local/bin/deno run \
   --allow-net --allow-run --allow-read --allow-env \
   cli/deno.ts \
   --host 0.0.0.0 \
