@@ -643,20 +643,43 @@ fi
 if [ "$CURRENT_PHASE" -le 7 ]; then
     phase "Phase 7: Orchestrator (claude-code-by-agents)"
 
-    if ! sudo -u claude-agent bash -c 'command -v deno' &>/dev/null; then
+    # ── Install Deno for claude-agent user ──
+    DENO_BIN="/home/claude-agent/.deno/bin/deno"
+    if [ ! -x "$DENO_BIN" ]; then
+        info "Installing Deno for claude-agent user..."
         sudo -u claude-agent bash -c 'curl -fsSL https://deno.land/install.sh | sh'
-        echo 'export PATH="$HOME/.deno/bin:$PATH"' | sudo -u claude-agent tee -a /home/claude-agent/.bashrc > /dev/null
+        # Add to bashrc for interactive use
+        if ! grep -q '\.deno/bin' /home/claude-agent/.bashrc 2>/dev/null; then
+            echo 'export PATH="$HOME/.deno/bin:$PATH"' | sudo -u claude-agent tee -a /home/claude-agent/.bashrc > /dev/null
+        fi
     fi
-    ok "Deno installed"
 
-    if [ ! -d /opt/claude-code-by-agents ]; then
-        git clone https://github.com/baryhuang/claude-code-by-agents.git /opt/claude-code-by-agents
-        chown -R claude-agent:claude-agent /opt/claude-code-by-agents
-        cd /opt/claude-code-by-agents/backend
-        sudo -u claude-agent /home/claude-agent/.deno/bin/deno install
-        ok "Orchestrator installed"
+    if [ -x "$DENO_BIN" ]; then
+        ok "Deno: $($DENO_BIN --version 2>/dev/null | head -1)"
     else
-        ok "Orchestrator already present"
+        fail "Deno installation failed"
+        exit 1
+    fi
+
+    # ── Clone and set up claude-code-by-agents ──
+    ORCHESTRATOR_DIR="/opt/claude-code-by-agents"
+
+    if [ ! -d "$ORCHESTRATOR_DIR" ]; then
+        info "Cloning claude-code-by-agents..."
+        git clone https://github.com/baryhuang/claude-code-by-agents.git "$ORCHESTRATOR_DIR"
+    fi
+
+    chown -R claude-agent:claude-agent "$ORCHESTRATOR_DIR"
+
+    # Cache Deno dependencies so the service starts cleanly
+    info "Caching orchestrator dependencies..."
+    sudo -u claude-agent bash -c "cd ${ORCHESTRATOR_DIR}/backend && ${DENO_BIN} install --allow-scripts 2>/dev/null || ${DENO_BIN} cache cli/deno.ts 2>/dev/null || true"
+
+    # Quick sanity check — does the dev task exist?
+    if sudo -u claude-agent bash -c "cd ${ORCHESTRATOR_DIR}/backend && ${DENO_BIN} task 2>/dev/null" | grep -q "dev"; then
+        ok "Orchestrator installed (deno task dev available)"
+    else
+        warn "Orchestrator cloned but 'deno task dev' not found — service may fail"
     fi
 
     save_state 8
@@ -829,6 +852,16 @@ SyslogIdentifier=claude-agentapi
 WantedBy=multi-user.target
 EOF
 
+    # The orchestrator (claude-code-by-agents) is a Deno web UI that
+    # spawns Claude Code processes. It defaults to 0.0.0.0:8080.
+    #
+    # Key fixes:
+    #   - DENO_DIR must point to the cache directory, not the bin directory
+    #   - --claude-path tells it where to find the claude binary
+    #     (required because /usr/local/bin isn't in MicroOS sudo secure_path)
+    #   - We run the server directly instead of 'deno task dev' (which uses --watch
+    #     and would restart on every file change — bad for production)
+    #   - HOME must be set so Deno can find its cache
     cat > /etc/systemd/system/claude-orchestrator.service << 'EOF'
 [Unit]
 Description=Claude Code Orchestrator (claude-code-by-agents)
@@ -840,9 +873,15 @@ Type=simple
 User=claude-agent
 WorkingDirectory=/opt/claude-code-by-agents/backend
 EnvironmentFile=/etc/claude/api-key
-Environment="DENO_DIR=/home/claude-agent/.deno"
+Environment="HOME=/home/claude-agent"
+Environment="DENO_DIR=/home/claude-agent/.cache/deno"
 Environment="PATH=/home/claude-agent/.deno/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/home/claude-agent/.deno/bin/deno task dev
+ExecStart=/home/claude-agent/.deno/bin/deno run \
+  --allow-net --allow-run --allow-read --allow-env \
+  cli/deno.ts \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --claude-path /usr/local/bin/claude
 Restart=always
 RestartSec=10
 StandardOutput=journal
