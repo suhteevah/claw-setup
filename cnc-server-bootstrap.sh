@@ -219,17 +219,32 @@ if [ "$CURRENT_PHASE" -le 1 ]; then
     # 1. Removed version numbers from nodejs/npm (Rolling release compatible)
     # 2. Added 'unzip' (Required for Deno install)
     # 3. Added 'tar' (Required for manual Ollama install)
+    # 4. Split into core + optional so one missing package doesn't abort everything
+
+    # Core packages — these must all exist on MicroOS
     transactional-update --non-interactive pkg install \
         openssh-server \
         git curl wget jq htop tmux \
         gcc gcc-c++ make ccache clang lld \
-        ripgrep \
-        icecream icecream-clang-wrappers \
-        podman podman-docker distrobox \
+        podman \
         nodejs npm \
         tailscale \
         firewalld \
         unzip tar
+
+    # Optional packages — nice to have, but don't abort if missing
+    # Some of these may not exist in all MicroOS repos (e.g. icecream-clang-wrappers)
+    transactional-update --non-interactive --continue pkg install \
+        ripgrep \
+        icecream \
+        distrobox \
+        2>/dev/null || warn "Some optional packages not available — continuing"
+
+    # Try icecream extras + podman-docker (commonly missing on minimal installs)
+    transactional-update --non-interactive --continue pkg install \
+        icecream-clang-wrappers \
+        podman-docker \
+        2>/dev/null || warn "icecream-clang-wrappers or podman-docker not found — skipping"
 
     # Chain onto the SAME snapshot — --continue is mandatory here
     transactional-update --non-interactive --continue run systemctl enable sshd.service 2>/dev/null || true
