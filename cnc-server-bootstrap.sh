@@ -210,7 +210,12 @@ if [ "$CURRENT_PHASE" -le 1 ]; then
     info "Installing core packages via transactional-update..."
     info "This creates a new btrfs snapshot — takes a minute."
 
-    # FIX:
+    # CRITICAL: All transactional-update calls MUST be chained with --continue.
+    # Without --continue, each call forks a NEW snapshot from the ORIGINAL base,
+    # orphaning the previous snapshot's changes. The boot target ends up pointing
+    # at the last snapshot (which only has the systemctl change, not the packages).
+    #
+    # FIX notes:
     # 1. Removed version numbers from nodejs/npm (Rolling release compatible)
     # 2. Added 'unzip' (Required for Deno install)
     # 3. Added 'tar' (Required for manual Ollama install)
@@ -226,11 +231,10 @@ if [ "$CURRENT_PHASE" -le 1 ]; then
         firewalld \
         unzip tar
 
-    # Ensure sshd stays enabled in the new snapshot
-    # (transactional-update runs in a chroot — enable it there too)
-    transactional-update --non-interactive run systemctl enable sshd.service 2>/dev/null || true
+    # Chain onto the SAME snapshot — --continue is mandatory here
+    transactional-update --non-interactive --continue run systemctl enable sshd.service 2>/dev/null || true
 
-    ok "Packages staged in new snapshot (including openssh-server)"
+    ok "Packages + sshd enable staged in single snapshot"
     warn "A reboot is needed to activate the new snapshot."
     NEEDS_REBOOT=1
 
