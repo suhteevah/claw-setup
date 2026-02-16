@@ -676,10 +676,13 @@ if [ "$CURRENT_PHASE" -le 7 ]; then
 
     chown -R claude-agent:claude-agent "$ORCHESTRATOR_DIR"
 
-    # Cache Deno dependencies so the service starts cleanly
-    # Run as claude-agent so the cache lands in their home dir
+    # Cache Deno dependencies so the service starts cleanly.
+    # This downloads all npm/jsr imports ahead of time.
+    # Run as claude-agent with HOME set so the cache lands in their home dir.
     info "Caching orchestrator dependencies..."
-    sudo -u claude-agent bash -c "cd ${ORCHESTRATOR_DIR}/backend && ${DENO_BIN} install --allow-scripts 2>/dev/null || ${DENO_BIN} cache cli/deno.ts 2>/dev/null || true"
+    sudo -u claude-agent bash -c "export HOME=/home/claude-agent && cd ${ORCHESTRATOR_DIR}/backend && ${DENO_BIN} cache cli/deno.ts 2>&1" || {
+        warn "Dependency caching had errors — service may need to download on first start"
+    }
 
     # Quick sanity check — does the dev task exist?
     if sudo -u claude-agent bash -c "cd ${ORCHESTRATOR_DIR}/backend && ${DENO_BIN} task 2>/dev/null" | grep -q "dev"; then
@@ -688,9 +691,9 @@ if [ "$CURRENT_PHASE" -le 7 ]; then
         warn "Orchestrator cloned but 'deno task dev' not found — service may fail"
     fi
 
-    # Also symlink into user's .deno/bin for interactive use
+    # Symlink into user's .deno/bin for interactive use
     sudo -u claude-agent mkdir -p /home/claude-agent/.deno/bin
-    ln -sf /usr/local/bin/deno /usr/local/bin/deno 2>/dev/null || true
+    ln -sf /usr/local/bin/deno /home/claude-agent/.deno/bin/deno 2>/dev/null || true
 
     save_state 8
 fi
@@ -887,7 +890,7 @@ Environment="HOME=/home/claude-agent"
 Environment="DENO_DIR=/home/claude-agent/.cache/deno"
 Environment="PATH=/usr/local/bin:/usr/bin:/bin"
 ExecStart=/usr/local/bin/deno run \
-  --allow-net --allow-run --allow-read --allow-env \
+  --allow-net --allow-run --allow-read --allow-write --allow-env \
   cli/deno.ts \
   --host 0.0.0.0 \
   --port 8080 \
