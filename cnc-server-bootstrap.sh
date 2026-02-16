@@ -163,15 +163,45 @@ fi
 
 
 # ==============================================================================
-# Phase 1: Transactional Update — Core Packages
+# Phase 1: Ensure SSH + Transactional Update — Core Packages
 # ==============================================================================
 if [ "$CURRENT_PHASE" -le 1 ]; then
-    phase "Phase 1: Transactional Update — Core Packages"
+    phase "Phase 1: SSH + Transactional Update — Core Packages"
+
+    # ── Ensure SSH is enabled BEFORE reboot so we don't get locked out ──
+    info "Ensuring SSH is enabled..."
+    if systemctl is-enabled sshd &>/dev/null 2>&1; then
+        ok "sshd already enabled"
+    elif systemctl is-enabled ssh &>/dev/null 2>&1; then
+        ok "ssh already enabled"
+    else
+        # Try to enable whichever exists
+        if systemctl list-unit-files sshd.service &>/dev/null 2>&1; then
+            systemctl enable --now sshd.service
+            ok "sshd enabled and started"
+        elif systemctl list-unit-files ssh.service &>/dev/null 2>&1; then
+            systemctl enable --now ssh.service
+            ok "ssh enabled and started"
+        else
+            warn "No SSH service found — adding openssh-server to install list"
+        fi
+    fi
+
+    # Make sure sshd is running RIGHT NOW (before reboot)
+    systemctl start sshd.service 2>/dev/null || systemctl start ssh.service 2>/dev/null || true
+
+    # Open SSH port in firewall immediately (firewalld may already be running)
+    if command -v firewall-cmd &>/dev/null && systemctl is-active firewalld &>/dev/null 2>&1; then
+        firewall-cmd --permanent --add-service=ssh 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
+        ok "SSH port opened in firewall"
+    fi
 
     info "Installing core packages via transactional-update..."
     info "This creates a new btrfs snapshot — takes a minute."
 
     transactional-update --non-interactive pkg install \
+        openssh-server \
         git curl wget jq htop tmux \
         gcc gcc-c++ make ccache clang lld \
         ripgrep \
@@ -181,13 +211,18 @@ if [ "$CURRENT_PHASE" -le 1 ]; then
         tailscale \
         firewalld
 
-    ok "Packages staged in new snapshot"
+    # Ensure sshd stays enabled in the new snapshot
+    # (transactional-update runs in a chroot — enable it there too)
+    transactional-update --non-interactive run systemctl enable sshd.service 2>/dev/null || true
+
+    ok "Packages staged in new snapshot (including openssh-server)"
     warn "A reboot is needed to activate the new snapshot."
     NEEDS_REBOOT=1
 
     save_state 2
     echo ""
     echo -e "${BOLD}${YELLOW}>>> REBOOT REQUIRED <<<${NC}"
+    echo -e "SSH is enabled — you will be able to reconnect after reboot."
     echo "Run: sudo reboot"
     echo "Then re-run this script: sudo bash cnc-server-bootstrap.sh"
     echo ""
@@ -200,6 +235,14 @@ fi
 # ==============================================================================
 if [ "$CURRENT_PHASE" -le 2 ]; then
     phase "Phase 2: Verify Packages + Tailscale"
+
+    # Verify SSH survived the reboot
+    if systemctl is-active sshd &>/dev/null 2>&1 || systemctl is-active ssh &>/dev/null 2>&1; then
+        ok "SSH: active"
+    else
+        warn "SSH not running! Attempting to start..."
+        systemctl enable --now sshd.service 2>/dev/null || systemctl enable --now ssh.service 2>/dev/null || true
+    fi
 
     # Verify the transactional update took effect
     for cmd in git clang iceccd node tailscale podman; do
